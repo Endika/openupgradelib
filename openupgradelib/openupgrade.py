@@ -23,17 +23,39 @@ import sys
 import os
 import inspect
 import logging
-from openerp import release, tools, SUPERUSER_ID
-from openerp.tools.yaml_import import yaml_import
-from openerp.osv import orm
-from openerp.tools.mail import plaintext2html
-from openerp.modules.registry import RegistryManager
-import openerp.osv.fields
-import openerp.fields
 from . import openupgrade_tools
+try:
+    from openerp import release
+except ImportError:
+    import release
+Many2many = False
+One2many = False
+if not hasattr(release, 'version_info'):
+    version_info = tuple(map(int, release.version.split('.')))
+else:
+    version_info = release.version_info
+if version_info[0] > 6 or version_info[0:2] == (6, 1):
+    from openerp import tools, SUPERUSER_ID
+    from openerp.tools.yaml_import import yaml_import
+    from openerp.osv.orm import except_orm
+    from openerp.modules.registry import RegistryManager
+    from openerp.osv.fields import many2many, one2many
+    if version_info[0] >= 7:
+        from openerp.tools.mail import plaintext2html
+    if version_info[0] >= 8:
+        from openerp.fields import Many2many, One2many
+else:
+    # version < 6.1
+    import tools
+    SUPERUSER_ID = 1
+    from tools.yaml_import import yaml_import
+    from osv.osv import except_osv as except_orm
+    RegistryManager = None
+    from osv.fields import many2many, one2many
 
 if sys.version_info[0] == 3:
     unicode = str
+
 
 # The server log level has not been set at this point
 # so to log at loglevel debug we need to set it
@@ -154,7 +176,9 @@ def copy_columns(cr, column_spec):
     :param column_spec: a hash with table keys, with lists of tuples as \
     values. Tuples consist of (old_name, new_name, type). Use None for \
     new_name to trigger a conversion of old_name using get_legacy_name() \
-    Use None for type to use type of old field
+    Use None for type to use type of old field.
+    Make sure to quote properly, if your column name coincides with a
+    SQL directive. eg. '"column"'
 
     .. versionadded:: 8.0
     """
@@ -189,6 +213,8 @@ def rename_columns(cr, column_spec):
     :param column_spec: a hash with table keys, with lists of tuples as \
     values. Tuples consist of (old_name, new_name). Use None for new_name \
     to trigger a conversion of old_name using get_legacy_name()
+    Make sure to quote properly, if your column name coincides with a
+    SQL directive. eg. '"column"'
     """
     for table in column_spec.keys():
         for (old, new) in column_spec[table]:
@@ -246,6 +272,8 @@ def rename_models(cr, model_spec):
                    'WHERE relation = %s', (new, old,))
         cr.execute('UPDATE ir_model_data SET model = %s '
                    'WHERE model = %s', (new, old,))
+        cr.execute('UPDATE ir_attachment SET res_model = %s '
+                   'WHERE res_model = %s', (new, old,))
     # TODO: signal where the model occurs in references to ir_model
 
 
@@ -432,7 +460,7 @@ def warn_possible_dataloss(cr, pool, old_module, fields):
                     field['field'], field['new_module'], row[0])
 
 
-def set_defaults(cr, pool, default_spec, force=False):
+def set_defaults(cr, pool, default_spec, force=False, use_orm=False):
     """
     Set default value. Useful for fields that are newly required. Uses orm, so
     call from the post script.
@@ -447,23 +475,52 @@ def set_defaults(cr, pool, default_spec, force=False):
     process. Beware of issues with resources loaded from new data that \
     actually do require the model's default, in combination with the post \
     script possible being run multiple times.
+    :param use_orm: If set to True, the write operation of the default value \
+    will be triggered using ORM instead on an SQL clause (default).
     """
 
     def write_value(ids, field, value):
         logger.debug(
             "model %s, field %s: setting default value of resources %s to %s",
             model, field, ids, unicode(value))
-        for res_id in ids:
-            # Iterating over ids here as a workaround for lp:1131653
-            obj.write(cr, SUPERUSER_ID, [res_id], {field: value})
+        if use_orm:
+            for res_id in ids:
+                # Iterating over ids here as a workaround for lp:1131653
+                obj.write(cr, SUPERUSER_ID, [res_id], {field: value})
+        else:
+            query, params = "UPDATE %s SET %s = %%s WHERE id IN %%s" % (
+                obj._table, field), (value, tuple(ids))
+            # handle fields inherited from somewhere else
+            if field not in obj._columns:
+                query, params = None, None
+                for model_name in obj._inherits:
+                    if obj._inherit_fields[field][0] != model_name:
+                        continue
+                    col = obj._inherits[model_name]
+                    # this is blatantly stolen and adapted from
+                    # https://github.com/OCA/OCB/blob/def7db0b93e45eda7b51b3b61
+                    # bae1e975d07968b/openerp/osv/orm.py#L4307
+                    nids = []
+                    for sub_ids in cr.split_for_in_conditions(ids):
+                        cr.execute(
+                            'SELECT DISTINCT %s FROM %s WHERE id IN %%s' % (
+                                col, obj._table), (sub_ids,))
+                        nids.extend(x for x, in cr.fetchall())
+                    query, params = "UPDATE %s SET %s = %%s WHERE id IN %%s" %\
+                        (pool[model_name]._table, field), (value, tuple(nids))
+            if not query:
+                raise Exception("Can't set default for %s on %s!",
+                                field, obj._name)
+            # cope with really big tables
+            for sub_ids in cr.split_for_in_conditions(params[1]):
+                cr.execute(query, (params[0], sub_ids))
 
     for model in default_spec.keys():
         obj = pool.get(model)
         if not obj:
-            raise orm.except_orm(
+            raise except_orm(
                 "Error",
                 "Migration: error setting default, no such model: %s" % model)
-
         for field, value in default_spec[model]:
             domain = not force and [(field, '=', False)] or []
             ids = obj.search(cr, SUPERUSER_ID, domain)
@@ -497,8 +554,8 @@ def set_defaults(cr, pool, default_spec, force=False):
                         "None default value not in %s' _defaults" % (
                             field, model))
                     logger.error(error)
-                    # this exeption seems to get lost in a higher up try block
-                    orm.except_orm("OpenUpgrade", error)
+                    # this exception seems to get lost in a higher up try block
+                    except_orm("OpenUpgrade", error)
             else:
                 write_value(ids, field, value)
 
@@ -555,6 +612,10 @@ def update_module_names(cr, namespec):
         query = ("UPDATE ir_module_module_dependency SET name = %s "
                  "WHERE name = %s")
         logged_query(cr, query, (new_name, old_name))
+        if version_info[0] > 7:
+            query = ("UPDATE ir_translation SET module = %s "
+                     "WHERE module = %s")
+            logged_query(cr, query, (new_name, old_name))
 
 
 def add_ir_model_fields(cr, columnspec):
@@ -583,8 +644,8 @@ def get_legacy_name(original_name):
     :param original_name: the original name of the column
     :param version: current version as passed to migrate()
     """
-    return 'openupgrade_legacy_'+('_').join(
-        map(str, release.version_info[0:2]))+'_'+original_name
+    return 'openupgrade_legacy_' + '_'.join(
+        map(str, version_info[0:2])) + '_' + original_name
 
 
 def m2o_to_x2m(cr, model, table, field, source_field):
@@ -606,13 +667,15 @@ def m2o_to_x2m(cr, model, table, field, source_field):
     .. versionadded:: 8.0
     """
     if not model._columns.get(field):
-        raise orm.except_orm(
+        raise except_orm(
             "Error", "m2o_to_x2m: field %s doesn't exist in model %s" % (
                 field, model._name))
-    if isinstance(model._columns[field], (openerp.osv.fields.many2many,
-                                          openerp.fields.Many2many)):
-        rel, id1, id2 = openerp.osv.fields.many2many._sql_names(
-            model._columns[field], model)
+    if isinstance(model._columns[field], (many2many, Many2many)):
+        column = model._columns[field]
+        if version_info[0] > 6 or version_info[0:2] == (6, 1):
+            rel, id1, id2 = many2many._sql_names(column, model)
+        else:
+            rel, id1, id2 = column._rel, column._id1, column._id2
         logged_query(
             cr,
             """
@@ -622,9 +685,8 @@ def m2o_to_x2m(cr, model, table, field, source_field):
             WHERE %s is not null
             """ %
             (rel, id1, id2, source_field, table, source_field))
-    elif isinstance(model._columns[field], (openerp.fields.One2many,
-                                            openerp.osv.fields.one2many)):
-        if isinstance(model._columns[field], openerp.fields.One2many):
+    elif isinstance(model._columns[field], (One2many, one2many)):
+        if isinstance(model._columns[field], One2many):
             target_table = (
                 model.pool[model._columns[field].comodel_name]._table)
             target_field = model._columns[field].inverse_name
@@ -643,7 +705,7 @@ def m2o_to_x2m(cr, model, table, field, source_field):
                    'source_field': source_field,
                    'source_table': table})
     else:
-        raise orm.except_orm(
+        raise except_orm(
             "Error", "m2o_to_x2m: field %s of model %s is not a "
                      "many2many/one2many one" % (field, model._name))
 
@@ -694,6 +756,7 @@ def map_values(
     """
     Map old values to new values within the same model or table. Old values
     presumably come from a legacy column.
+    You will typically want to use it in post-migration scripts.
 
     :param cr: The database cursor
     :param source_column: the database column that contains old values to be \
@@ -701,6 +764,7 @@ def map_values(
     :param target_column: the database column, or model field (if 'write' is \
     'orm') that the new values are written to
     :para mapping: list of tuples [(old value, new value)]
+    Old value True represents "is set", False "is not set".
     :param model: used for writing if 'write' is 'orm', or to retrieve the \
     table if 'table' is not given.
     :param table: the database table used to query the old values, and write \
@@ -725,20 +789,34 @@ def map_values(
             " columns : %s",
             source_column)
     for old, new in mapping:
+        new = "'%s'" % new
+
+        if old is True:
+            old = 'NOT NULL'
+            op = 'IS'
+        elif old is False:
+            old = 'NULL'
+            op = 'IS'
+        else:
+            old = "'%s'" % old
+            op = '='
+
         values = {
             'table': table,
             'source': source_column,
             'target': target_column,
             'old': old,
             'new': new,
+            'op': op,
         }
+
         if write == 'sql':
             query = """UPDATE %(table)s
-                       SET %(target)s = %%(new)s
-                       WHERE %(source)s = %%(old)s""" % values
+                       SET %(target)s = %(new)s
+                       WHERE %(source)s %(op)s %(old)s""" % values
         else:
             query = """SELECT id FROM %(table)s
-                       WHERE %(source)s = %%(old)s""" % values
+                       WHERE %(source)s %(op)s %(old)s""" % values
         logged_query(cr, query, values)
         if write == 'orm':
             model.write(
@@ -1003,7 +1081,13 @@ def move_field_m2o(
 def convert_field_to_html(cr, table, field_name, html_field_name):
     """
     Convert field value to HTML value.
+
+    .. versionadded:: 7.0
     """
+    if version_info[0] < 7:
+        logger.error("You cannot use this method in an OpenUpgrade version "
+                     "prior to 7.0.")
+        return
     cr.execute(
         "SELECT id, %(field)s FROM %(table)s WHERE %(field)s IS NOT NULL" % {
             'field': field_name,
@@ -1012,7 +1096,7 @@ def convert_field_to_html(cr, table, field_name, html_field_name):
     )
     for row in cr.fetchall():
         logged_query(
-            cr, "UPDATE %(table)s SET %(field)s = %s WHERE id = %s" % {
+            cr, "UPDATE %(table)s SET %(field)s = %%s WHERE id = %%s" % {
                 'field': html_field_name,
                 'table': table,
             }, (plaintext2html(row[1]), row[0])
@@ -1062,3 +1146,14 @@ def date_to_datetime_tz(
                 AND rp.tz='%(timezone)s';
             """ % values)
     cr.execute("RESET TIMEZONE")
+
+
+def is_module_installed(cr, module):
+    """ Check if `module` is installed.
+
+    :return: True / False
+    """
+    cr.execute(
+        "SELECT id FROM ir_module_module "
+        "WHERE name=%s and state IN ('installed', 'to upgrade')", (module,))
+    return bool(cr.fetchone())

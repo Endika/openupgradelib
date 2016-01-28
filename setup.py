@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import openupgradelib
 
 try:
     from setuptools import setup
@@ -18,7 +19,10 @@ with open('HISTORY.rst') as history_file:
 dirname = os.path.dirname(__file__)
 
 with open(os.path.join(dirname, 'requirements.txt')) as requirements_file:
-    requirements = requirements_file.readlines()
+    requirements = filter(
+        lambda s: not s.startswith('#'),
+        map(str.strip, requirements_file.readlines())
+    )
 
 test_requirements = [
     'coverage',
@@ -29,22 +33,21 @@ test_requirements = [
 
 setup(
     name='openupgradelib',
-    version='0.1.2',
-    description="A library with support functions to be called from Odoo "
-                "migration scripts.",
+    version=openupgradelib.__version__,
+    description=openupgradelib.__doc__,
     long_description=readme + '\n\n' + history,
-    author="Odoo Community Association",
-    author_email='support@odoo-community.org',
+    author=openupgradelib.__author__,
+    author_email=openupgradelib.__email__,
     url='https://github.com/OCA/openupgradelib',
     packages=['openupgradelib'],
     package_dir={'openupgradelib': 'openupgradelib'},
     include_package_data=True,
     install_requires=requirements,
-    license="AGPL-3",
+    license=openupgradelib.__license__,
     zip_safe=False,
     keywords='openupgradelib',
     classifiers=[
-        'Development Status :: 2 - Pre-Alpha',
+        'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: BSD License',
         'Natural Language :: English',
